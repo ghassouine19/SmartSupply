@@ -1,0 +1,111 @@
+# Environment / Secrets
+
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+*.so
+
+.venv/
+venv/
+env/
+ENV/
+
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Testing / Coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Type checking / Linters
+.mypy_cache/
+.pyre/
+.ruff_cache/
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+logs/
+
+# Airflow
+airflow/logs/
+airflow/airflow.cfg
+airflow/airflow.db
+airflow/webserver_config.py
+
+# Spark
+spark-warehouse/
+metastore_db/
+derby.log/
+
+# ML
+mlruns/
+mlartifacts/
+*.pkl
+*.pickle
+*.joblib
+*.onnx
+
+# Data
+data/raw/
+data/bronze/
+data/silver/
+data/gold/
+data/processed/
+data/external/
+
+# Keep sample data
+!data/samples/
+!data/samples/**
+
+# Large data files
+*.csv
+*.parquet
+*.json
+*.jsonl
+*.avro
+*.orc
+
+# Model outputs
+models/
+artifacts/
+outputs/
+checkpoints/
+
+# Docker
+docker-data/
+docker-volumes/
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# OS / temporary
+.Docker/
