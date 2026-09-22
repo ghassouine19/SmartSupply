@@ -1,0 +1,488 @@
+version: "3.8"
+
+networks:
+  smartsupply_network:
+    name: ${PROJECT_NAME}_network
+    driver: bridge
+
+volumes:
+  postgres_data:
+  minio_data:
+  mlflow_data:
+  airflow_logs:
+
+
+services:
+
+  # ============================================================
+  # PostgreSQL
+  # ============================================================
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: ${PROJECT_NAME}_postgres
+    restart: unless-stopped
+
+    networks:
+      - smartsupply_network
+
+    ports:
+      - "${POSTGRES_PORT}:5432"
+
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+
+  # ============================================================
+  # MinIO - Data Lake
+  # ============================================================
+
+  minio:
+    image: minio/minio:latest
+    container_name: ${PROJECT_NAME}_minio
+    restart: unless-stopped
+
+    networks:
+      - smartsupply_network
+
+    ports:
+      - "${MINIO_API_PORT}:9000"
+      - "${MINIO_CONSOLE_PORT}:9001"
+
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+
+    volumes:
+      - minio_data:/data
+
+    command: server /data --console-address ":9001"
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl",
+          "-f",
+          "http://localhost:9000/minio/health/live"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+
+  # ============================================================
+  # MinIO Bootstrap
+  # ============================================================
+
+  minio-bootstrap:
+    image: minio/mc:latest
+    container_name: ${PROJECT_NAME}_minio_bootstrap
+
+    networks:
+      - smartsupply_network
+
+    depends_on:
+      minio:
+        condition: service_healthy
+
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000
+      ${MINIO_ROOT_USER}
+      ${MINIO_ROOT_PASSWORD};
+
+      mc mb --ignore-existing local/${MINIO_BRONZE_BUCKET};
+
+      mc mb --ignore-existing local/${MINIO_SILVER_BUCKET};
+
+      mc mb --ignore-existing local/${MINIO_GOLD_BUCKET};
+
+      echo 'MinIO bootstrap completed';
+      "
+
+
+  # ============================================================
+  # Spark Master
+  # ============================================================
+
+  spark-master:
+    build:
+      context: .
+      dockerfile: docker/spark/Dockerfile
+
+    container_name: ${PROJECT_NAME}_spark_master
+    restart: unless-stopped
+
+    networks:
+      - smartsupply_network
+
+    ports:
+      - "${SPARK_MASTER_PORT}:7077"
+      - "${SPARK_WEBUI_PORT}:8080"
+
+    env_file:
+      - .env
+
+    environment:
+      SPARK_MODE: master
+
+      PYTHONPATH: /opt/spark
+
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+
+      SPARK_DAEMON_MEMORY: 1g
+      SPARK_EXECUTOR_MEMORY: 2g
+      SPARK_EXECUTOR_CORES: 2
+
+      SPARK_NETWORK_TIMEOUT: 600s
+      SPARK_EXECUTOR_HEARTBEATINTERVAL: 60s
+      SPARK_SQL_SHUFFLE_PARTITIONS: 50
+
+    volumes:
+      - ./src:/opt/spark/src
+      - ./data:/opt/spark/data
+      - ./notebooks:/opt/spark/notebooks
+
+    depends_on:
+      minio:
+        condition: service_healthy
+
+      minio-bootstrap:
+        condition: service_completed_successfully
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl",
+          "-f",
+          "http://localhost:8080"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+
+  # ============================================================
+  # Spark Worker
+  # ============================================================
+
+  spark-worker:
+    build:
+      context: .
+      dockerfile: docker/spark/Dockerfile
+
+    container_name: ${PROJECT_NAME}_spark_worker
+    restart: unless-stopped
+
+    networks:
+      - smartsupply_network
+
+    ports:
+      - "${SPARK_WORKER_WEBUI_PORT}:8081"
+
+    env_file:
+      - .env
+
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+
+      PYTHONPATH: /opt/spark
+
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 3G
+
+    mem_limit: 4g
+
+    volumes:
+      - ./src:/opt/spark/src
+      - ./data:/opt/spark/data
+
+    depends_on:
+      spark-master:
+        condition: service_healthy
+
+      minio:
+        condition: service_healthy
+
+
+  # ============================================================
+  # MLflow
+  # ============================================================
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:latest
+    container_name: ${PROJECT_NAME}_mlflow
+    restart: unless-stopped
+
+    networks:
+      - smartsupply_network
+
+    ports:
+      - "${MLFLOW_PORT}:5000"
+
+    environment:
+      MLFLOW_BACKEND_STORE_URI: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+
+    volumes:
+      - mlflow_data:/mlruns
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri
+      postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      --default-artifact-root /mlruns
+
+
+  # ============================================================
+  # Airflow Init
+  # ============================================================
+
+  airflow-init:
+    build:
+      context: .
+      dockerfile: docker/airflow/Dockerfile
+
+    container_name: ${PROJECT_NAME}_airflow_init
+
+    networks:
+      - smartsupply_network
+
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: >-
+        postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    entrypoint: >
+      /bin/sh -c "
+      airflow db migrate &&
+      airflow users create
+      --username ${AIRFLOW_ADMIN_USER}
+      --password ${AIRFLOW_ADMIN_PASSWORD}
+      --firstname Admin
+      --lastname SmartSupply
+      --role Admin
+      --email admin@smartsupply.local
+      || true;
+      echo 'Airflow initialization completed';
+      "
+
+    restart: "no"
+
+
+  # ============================================================
+  # Airflow Scheduler
+  # ============================================================
+
+  airflow-scheduler:
+    build:
+      context: .
+      dockerfile: docker/airflow/Dockerfile
+
+    container_name: ${PROJECT_NAME}_airflow_scheduler
+    restart: unless-stopped
+
+    networks:
+      - smartsupply_network
+
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: >-
+        postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+
+      SPARK_MASTER_URL: spark://spark-master:7077
+
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./src:/opt/airflow/src
+      - ./data:/opt/airflow/data
+      - airflow_logs:/opt/airflow/logs
+
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+      spark-master:
+        condition: service_healthy
+
+      mlflow:
+        condition: service_started
+
+    command: scheduler
+
+
+  # ============================================================
+  # Airflow Webserver
+  # ============================================================
+
+  airflow-webserver:
+    build:
+      context: .
+      dockerfile: docker/airflow/Dockerfile
+
+    container_name: ${PROJECT_NAME}_airflow_webserver
+    restart: unless-stopped
+
+    networks:
+      - smartsupply_network
+
+    ports:
+      - "${AIRFLOW_PORT}:8080"
+
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: >-
+        postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY}
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - airflow_logs:/opt/airflow/logs
+
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+    command: webserver
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl",
+          "-f",
+          "http://localhost:8080/health"
+        ]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+
+  # ============================================================
+  # FastAPI
+  # ============================================================
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/api/Dockerfile
+
+    container_name: ${PROJECT_NAME}_api
+    restart: unless-stopped
+
+    networks:
+      - smartsupply_network
+
+    ports:
+      - "${API_PORT}:8000"
+
+    env_file:
+      - .env
+
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+
+    volumes:
+      - ./api:/app/api
+      - ./src:/app/src
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+      minio:
+        condition: service_healthy
+
+      mlflow:
+        condition: service_started
+
+    command: >
+      uvicorn api.main:app
+      --host 0.0.0.0
+      --port 8000
+      --reload
+
+
+  # ============================================================
+  # Streamlit Dashboard
+  # ============================================================
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: docker/dashboard/Dockerfile
+
+    container_name: ${PROJECT_NAME}_dashboard
+    restart: unless-stopped
+
+    networks:
+      - smartsupply_network
+
+    ports:
+      - "${DASHBOARD_PORT}:8501"
+
+    environment:
+      API_URL: http://api:8000
+
+    volumes:
+      - ./dashboard:/app/dashboard
+
+    depends_on:
+      api:
+        condition: service_started
+
+    command: >
+      streamlit run dashboard/app.py
+      --server.address=0.0.0.0
+      --server.port=8501
